@@ -10,12 +10,35 @@ Based in part on python-telegram-bot and boto3 sample code.
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 import logging
 import boto3
+import os
 
 # Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                     level=logging.INFO)
 
 logger = logging.getLogger(__name__)
+
+# Default configuration values until overridden
+default_config = {'label': 'True',
+                  'porn': 'False', 
+                  'threshold': '50', 
+                  'limit': '4', 
+                  'pause': 'False',
+                  'last_image': 'None'}
+
+# Useful for debugging
+keep_local_images = False
+
+# If True, images will be stored in a designated S3 bucket for processing.
+# If False, images will be uploaded seperately for each API call.
+use_s3 = True
+bucket = 'regoatnition-images-east'
+
+# If True, per-chat settings will be stored in the provided DynamoDB table
+# If False, they will be stored on locally on disk in the provided folder
+use_dynamo = False
+dynamo_table = "regoatnition-settings"
+local_settings_folder = "rekogbot_settings"
 
 #Convienent test data, but we won't use it live
 testimg={
@@ -25,46 +48,101 @@ testimg={
     }
 }
 
-def label_image(bot, update):
-    # Download the image
+def repeat(bot, update):
+    lastimage = setting(update.message.chat.id, 'last_image')
+    if lastimage == 'None':
+        update.message.reply_text("No previous image available to repeat")
+    else:
+        label_image(bot, update, image=lastimage, filename=lastimage)
+
+def label_image(bot, update, image=None, filename=None):
+    # Check if we're paused
+    if setting(update.message.chat.id, 'pause') == 'True':
+        return 0
+
+    # Check if we were provided with already-uploaded image id
+    if image==None:
+        filename = download_image(bot, update)
+        image = get_image(bot, update, filename)
+    else:
+        if use_s3:
+            image = {
+                'S3Object': {
+                    'Bucket': bucket,
+                    'Name': filename
+                }
+            }
+        else:
+            image = get_image(bot, update, filename)
+
+    reply_text = ""
+    if setting(update.message.chat.id, 'porn') == 'True':
+        reply_text += find_porn(bot, update, image, filename)
+
+    if setting(update.message.chat.id, 'label') == 'True':
+        reply_text += find_labels(bot, update, image, filename)
+
+    if reply_text:
+        update.message.reply_text(reply_text)
+    else:
+        update.message.reply_text("No tags found with {} % certainty".format(threshold))
+
+# Download the image in the message to local storage, return the name
+def download_image(bot, update):
     file_id = update.message.photo[-1].file_id
     new_file = bot.get_file(file_id)
-    path = "img/" + str(update.message.chat.id) + "-" + str(update.message.message_id)
-    new_file.download(custom_path=path)    #Save image to disc
-    with open(path, 'rb') as f:            #Read back off of disc
-        data = f.read()
-    img = {
-        'Bytes': data
-    }
+    filename = str(update.message.chat.id) + "-" + str(update.message.message_id)
+    path = "img/" + filename
+    new_file.download(custom_path=path)    
+    setting(update.message.chat.id, 'last_image', filename)
+    return filename
 
-    # Get the reply string ready
+# Get image as a binary blob or S3 reference
+# Which one is determined by the use_s3 setting
+def get_image(bot, update, filename):
+    if use_s3:
+        # Put file in S3
+        path = 'img/' + filename
+        s3 = boto3.resource('s3')
+        s3.meta.client.upload_file(path, bucket, filename)
+        img = {
+            'S3Object': {
+                'Bucket': bucket,
+                'Name': filename
+            }
+        }
+    else:
+        # Read file into memory
+        with open(path, 'rb') as f:
+            data = f.read()
+        img = {
+            'Bytes': data
+        }
+    if not keep_local_images:
+        os.remove(path)
+    return img
+
+def find_porn(bot, update, image, filename):
     text = ''
-
     threshold = float(setting(update.message.chat.id, 'threshold'))
-
-    if setting(update.message.chat.id, 'porn') == 'True':
-    # Porn tagging
-        logger.info("Porn tagging image {} using threshold {}".format(path, threshold))
-        try:
-            response = rekog.detect_moderation_labels(Image=img, MinConfidence=threshold)
-        except Exception as e:
-            errstr = "Porn tagging failed with error {}".format(e)
-            logger.error(errstr)
-            update.message.reply_text(errstr)
+    logger.info("Porn tagging image {} using threshold {}".format(filename, threshold))
+    try:
+        response = rekog.detect_moderation_labels(Image=image, MinConfidence=threshold)
         for thing in response['ModerationLabels']:
             if thing['Name'] == 'Explicit Nudity':
                 text += "Porn - {:.2f}%confidence\n".format(thing['Confidence'])
+    except Exception as e:
+        errstr = "Porn tagging failed with error: {}".format(e)
+        logger.error(errstr)
+        update.message.reply_text(errstr)
+    return text
 
-    if setting(update.message.chat.id, 'label') == 'True':
-    # Label tagging
-        logger.info("Label tagging image {} using threshold {}".format(path, threshold))
-        try:
-            response = rekog.detect_labels(Image=img, MinConfidence=threshold)
-        except Exception as e:
-            errstr = "Label tagging failed with error {}".format(e)
-            logger.error(errstr)
-            update.message.reply_text(errstr)
-        #TODO - use S3 to skip the second upload
+def find_labels(bot, update, image, filename):
+    text = ''
+    threshold = float(setting(update.message.chat.id, 'threshold'))
+    logger.info("Label tagging image {} using threshold {}".format(filename, threshold))
+    try:
+        response = rekog.detect_labels(Image=image, MinConfidence=threshold)
         tag_count = 0
         tag_limit = int(setting(update.message.chat.id, 'limit'))
         for thing in response['Labels']:
@@ -72,11 +150,12 @@ def label_image(bot, update):
                 break
             text += "{} - {:.2f}% confidence\n".format(thing['Name'], thing['Confidence'])
             tag_count += 1
+    except Exception as e:
+        errstr = "Label tagging failed with error: {}".format(e)
+        logger.error(errstr)
+        update.message.reply_text(errstr)
+    return text
 
-    if text:
-        update.message.reply_text(text)
-    else:
-        update.message.reply_text("No tags found with {} % certainty".format(threshold))
 
 # Define a few command handlers. These usually take the two arguments bot and
 # update. Error handlers also receive the raised TelegramError object in error.
@@ -101,6 +180,18 @@ def label_setting(bot, update):
 
 def porn_setting(bot, update):
     setting_toggler(update, name='porn')
+
+def pause_setting(bot, update):
+    setting_toggler(update, name='pause')
+
+def list_settings(bot, update):
+    text = ""
+    for key in default_config:
+        text += key
+        text += " : "
+        text += setting(update.message.chat.id, key)
+        text += "\n"
+    update.message.reply_text(text)
 
 def setting_toggler(update, name):
     chat = update.message.chat.id
@@ -148,10 +239,55 @@ def limit_setting(bot, update):
     setting(update.message.chat.id, 'limit', newvalue)
     update.message.reply_text("Tag limit set to {} for this chat".format(newvalue))
 
-#Look up per chat settings, and save them to a file
+# Get or set per-chat settings
 def setting(chat, name, newvalue=None):
-    config = {'label': 'True', 'porn': 'False', 'threshold': '50', 'limit': '4'}
-    filename = "rekogbot_settings/{}".format(chat)
+    if use_dynamo:
+        return setting_in_dynamo(chat, name, newvalue)
+    else:
+        return setting_on_disk(chat, name, newvalue)
+
+def setting_in_dynamo(chat, name, newvalue=None):
+    if newvalue==None:
+        return get_from_dynamo(chat, name)
+    else:
+        put_in_dynamo(chat, name, newvalue)
+
+def put_in_dynamo(chat, name, newvalue):
+    dynamo_client = boto3.client('dynamodb')
+    query = {
+        'TableName' : dynamo_table, 
+        'Item' : {
+            'chat_id' : {
+                'N' : str(chat)
+            },
+            name : {
+                'S' : str(newvalue)
+            }
+        }
+    }
+    dynamo_client.put_item(**query)
+
+def get_from_dynamo(chat, name):
+    dynamo_client = boto3.client('dynamodb')
+    query = {
+        'TableName' : dynamo_table,
+        'Key' : {
+            'chat_id' : {
+                'N' : str(chat)
+            },
+         },
+         'ConsistentRead' : True,
+         'AttributesToGet' : [name]
+    }
+    try:
+        response = dynamo_client.get_item(**query)
+        return response['Item'][name]['S']
+    except KeyError as e:
+        return default_config[name]
+        
+def setting_on_disk(chat, name, newvalue=None):
+    filename = local_settings_folder + "/{}".format(chat)
+    config = default_config.copy()
     try:
         with open(filename, 'r') as f:
             for line in f:
@@ -198,6 +334,9 @@ def main():
     dp.add_handler(CommandHandler("threshold", threshold_setting))
     dp.add_handler(CommandHandler("porn", porn_setting))
     dp.add_handler(CommandHandler("limit", limit_setting))
+    dp.add_handler(CommandHandler("pause", pause_setting))
+    dp.add_handler(CommandHandler("settings", list_settings))
+    dp.add_handler(CommandHandler("repeat", repeat))
 
     # on picture message, run the Rekognition workflow
     dp.add_handler(MessageHandler(Filters.photo, label_image))

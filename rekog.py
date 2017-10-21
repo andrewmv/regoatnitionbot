@@ -8,6 +8,7 @@ Based in part on python-telegram-bot and boto3 sample code.
 """
 
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+from PIL import Image, ImageDraw, ImageFont
 import logging
 import boto3
 import os
@@ -25,29 +26,121 @@ default_config = {'label': 'True',
                   'limit': '4', 
                   'pause': 'False',
                   'last_image': 'None',
-                  'celebrity': 'True'}
+                  'celebrity': 'True',
+                  'emotions': 'True'}
 
 # Useful for debugging
-keep_local_images = False
+keep_local_images = True
 
 # If True, images will be stored in a designated S3 bucket for processing.
 # If False, images will be uploaded seperately for each API call.
 use_s3 = True
 bucket = 'regoatnition-images-east'
 
-# If True, per-chat settings will be stored in the provided DynamoDB table
+# If True, per-chat settings will be stored in the provided DynamoDB table (Currently broken)
 # If False, they will be stored on locally on disk in the provided folder
 use_dynamo = False
 dynamo_table = "regoatnition-settings"
 local_settings_folder = "rekogbot_settings"
 
-#Convienent test data, but we won't use it live
-testimg={
-    'S3Object': {
-        'Bucket': 'andrewmv-sandbox',
-        'Name': 'DSC09809.JPG'
-    }
-}
+# Colors and fonts for image markup.
+# See Python Pillow library docs for acceptable color names
+rect_color_celeb = 'yellow'
+text_color_celeb = 'white'
+rect_color_face = 'green'
+text_color_face = 'white'
+
+def markup(bot, update):
+    lastimage = setting(update.message.chat.id, 'last_image')
+    if lastimage == 'None':
+        update.message.reply_text("No previous image available to analyize")
+    else:
+       try:
+           markup_image(bot, update, lastimage)
+       except Exception as e:
+           errstr = "Unable to mark image {}: {}".format(lastimage, e)
+           logger.error(errstr)
+           update.message.reply_text(errstr)
+
+def markup_image(bot, update, filename):
+    path = 'img/' + filename
+    mod_path = path + '-mod'
+    image = get_image(bot, update, filename)
+    match = False
+
+    try:
+        im = Image.open(path)
+        draw = ImageDraw.Draw(im)
+    except Exception as e:
+        errstr = "Unable to open image file {}: {}".format(filename, e)
+        logger.error(errstr)
+        update.message.reply_text(errstr)
+
+    if setting(update.message.chat.id, 'emotions') == 'True':
+        face_data = describe_faces(bot, update, image, filename)
+        try:
+            for face in face_data['FaceDetails']:
+                match = True
+                rect = rect_coords(face['BoundingBox'], im.size)
+                draw.rectangle(rect, outline=rect_color_face)
+                text_coord = (rect[1][0] + 2, rect[0][1])
+                emostring = u''
+                for emotion in face['Emotions']:
+                    emostring += u'{}:{:.0f}%\n'.format(emotion['Type'], emotion['Confidence'])
+                if face['Beard']['Value'] == True:
+                    emostring += u'Beard:{:.0f}%\n'.format(face['Beard']['Confidence'])
+                if face['Mustache']['Value'] == True:
+                    emostring += u'Mustache:{:.0f}%\n'.format(face['Mustache']['Confidence'])
+                shadow_text(text_coord, draw, emostring.rstrip(), 'black', text_color_face)
+        except Exception as e:
+            errstr = "Didn't recognize face data from server - dumped to logs."
+            errstr += "\nError: {}".format(e)
+            errstr += "\nemotion string: {}".format(emostring)
+            logger.error(errstr)
+            import json
+            logger.error(json.dumps(face_data, indent=1))
+            update.message.reply_text(errstr)
+
+    celeb_data = describe_celebrities(bot, update, image, filename)
+    try:
+        for celeb in celeb_data['CelebrityFaces']:
+            match = True
+            rect = rect_coords(celeb['Face']['BoundingBox'], im.size)
+            draw.rectangle(rect, outline=rect_color_celeb)
+            text_coord = (rect[0][0] + 2, rect[1][1] + 2)
+            text = u'{}\n{:.2f}%'.format(celeb['Name'], celeb['Face']['Confidence'])
+            shadow_text(text_coord, draw, text, 'black', text_color_celeb)
+        for pleb in celeb_data['UnrecognizedFaces']:
+            match = True
+            rect = rect_coords(pleb['BoundingBox'], im.size)
+            draw.rectangle(rect, outline=rect_color_face)
+    except KeyError as e:
+        errstr = "Didn't recognize celebrity data from server - dumped to logs."
+        errstr += "\nCouldn't find key {}".format(e)
+        logger.error(errstr)
+        import json
+        logger.error(json.dumps(celeb_data, indent=1))
+        update.message.reply_text(errstr)
+
+    if match:
+        im.save(mod_path, format=im.format)
+        update.message.reply_photo(open(mod_path, 'rb'))
+    else:
+        update.message.reply_text("Found no faces to mark")
+
+def shadow_text(rect, draw, text, shadow_color, body_color):
+    logger.debug(u'Drawing text \n{}\non draw object \n{}\nat {} using {} and {}'.format(text, draw, rect, shadow_color, body_color))
+    body_rect = (rect[0] + 1, rect[1] + 1)
+    draw.text(rect, text, fill=shadow_color)
+    draw.text(body_rect, text, fill=body_color)
+
+# Turn an AWS BoundingBox dictionary into a pair of tuples with absolute coords
+def rect_coords(bounding_box, image_size):
+    x1 = int(bounding_box['Left'  ] * image_size[0])
+    y1 = int(bounding_box['Top'   ] * image_size[1])
+    x2 = int(bounding_box['Width' ] * image_size[0]) + x1
+    y2 = int(bounding_box['Height'] * image_size[1]) + y1
+    return [(x1, y1), (x2, y2)]
 
 def repeat(bot, update):
     lastimage = setting(update.message.chat.id, 'last_image')
@@ -80,13 +173,13 @@ def label_image(bot, update, image=None, filename=None):
 
     reply_text = u''
     if setting(update.message.chat.id, 'porn') == 'True':
-        reply_text += find_porn(bot, update, image, filename)
+        reply_text += describe_porn_as_text(bot, update, image, filename)
 
     if setting(update.message.chat.id, 'celebrity') == 'True':
-        reply_text += find_celebrities(bot, update, image, filename)
+        reply_text += describe_celebrities_as_text(bot, update, image, filename)
 
     if setting(update.message.chat.id, 'label') == 'True':
-        reply_text += find_labels(bot, update, image, filename)
+        reply_text += describe_labels_as_text(bot, update, image, filename)
 
     if reply_text:
         update.message.reply_text(reply_text)
@@ -128,57 +221,85 @@ def get_image(bot, update, filename):
         os.remove(path)
     return img
 
-def find_porn(bot, update, image, filename):
+def describe_porn_as_text(bot, update, image, filename):
+    response = describe_porn(bot, update, image, filename)
+    if response==None:
+        return None
     text = u''
+    for thing in response['ModerationLabels']:
+        if thing['Name'] == 'Explicit Nudity':
+            text += "Porn - {:.2f}%confidence\n".format(thing['Confidence'])
+    return text
+
+def describe_porn(bot, update, image, filename):
     threshold = float(setting(update.message.chat.id, 'threshold'))
     logger.info("Porn tagging image {} using threshold {}".format(filename, threshold))
     try:
-        response = rekog.detect_moderation_labels(Image=image, MinConfidence=threshold)
-        for thing in response['ModerationLabels']:
-            if thing['Name'] == 'Explicit Nudity':
-                text += "Porn - {:.2f}%confidence\n".format(thing['Confidence'])
+        return rekog.detect_moderation_labels(Image=image, MinConfidence=threshold)
     except Exception as e:
         errstr = "Porn tagging failed with error: {}".format(e)
         logger.error(errstr)
         update.message.reply_text(errstr)
+    return None
+
+def describe_labels_as_text(bot, update, image, filename):
+    response = describe_labels(bot, update, image, filename)
+    if response==None:
+        return None
+    text = u''
+    tag_count = 0
+    tag_limit = int(setting(update.message.chat.id, 'limit'))
+    for thing in response['Labels']:
+        if tag_count >= tag_limit:
+            break
+        text += "{} - {:.2f}% confidence\n".format(thing['Name'], thing['Confidence'])
+        tag_count += 1
     return text
 
-def find_labels(bot, update, image, filename):
-    text = ''
+def describe_labels(bot, update, image, filename):
     threshold = float(setting(update.message.chat.id, 'threshold'))
     logger.info("Label tagging image {} using threshold {}".format(filename, threshold))
     try:
-        response = rekog.detect_labels(Image=image, MinConfidence=threshold)
-        tag_count = 0
-        tag_limit = int(setting(update.message.chat.id, 'limit'))
-        for thing in response['Labels']:
-            if tag_count >= tag_limit:
-                break
-            text += "{} - {:.2f}% confidence\n".format(thing['Name'], thing['Confidence'])
-            tag_count += 1
+        return rekog.detect_labels(Image=image, MinConfidence=threshold)
     except Exception as e:
         errstr = "Label tagging failed with error: {}".format(e)
         logger.error(errstr)
         update.message.reply_text(errstr)
+    return None
+
+def describe_celebrities_as_text(bot, update, image, filename):
+    response = describe_celebrities(bot, update, image, filename)
+    if response==None:
+        return None
+    text = u''
+    tag_count = 0
+    tag_limit = int(setting(update.message.chat.id, 'limit'))
+    for face in response['CelebrityFaces']:
+        if tag_count >= tag_limit:
+            break
+        text += u'{} - {:.2f}% confidence\n'.format(face['Name'], face['Face']['Confidence'])
+        tag_count += 1
     return text
 
-def find_celebrities(bot, update, image, filename):
-    text = u''
+def describe_faces(bot, update, image, filename):
+    logger.info("Face tagging image {}".format(filename))
+    try:
+        return rekog.detect_faces(Image=image, Attributes=[ 'ALL' ])
+    except Exception as e:
+        errstr = "Face tagging failed with error: {}".format(e)
+        logger.error(errstr)
+        update.message.reply_text(errstr)
+    return None
+
+def describe_celebrities(bot, update, image, filename):
     logger.info("Celebrity tagging image {}".format(filename))
     try:
-        response = rekog.recognize_celebrities(Image=image)
-        tag_count = 0
-        tag_limit = int(setting(update.message.chat.id, 'limit'))
-        for face in response['CelebrityFaces']:
-            if tag_count >= tag_limit:
-                break
-            text += u'{} - {:.2f}% confidence\n'.format(face['Name'], face['Face']['Confidence'])
-            tag_count += 1
+        return rekog.recognize_celebrities(Image=image)
     except Exception as e:
         errstr = "Celebrity tagging failed with error: {}".format(e)
         logger.error(errstr)
         update.message.reply_text(errstr)
-    return text
+    return None
 
 # Define a few command handlers. These usually take the two arguments bot and
 # update. Error handlers also receive the raised TelegramError object in error.
@@ -356,16 +477,17 @@ def main():
     dp.add_handler(CommandHandler("stop", stop))
 
     # options commands
-    dp.add_handler(CommandHandler("labels", label_setting))
+    dp.add_handler(CommandHandler("labels",    label_setting))
     dp.add_handler(CommandHandler("threshold", threshold_setting))
-    dp.add_handler(CommandHandler("porn", porn_setting))
-    dp.add_handler(CommandHandler("celeb", celeb_setting))
+    dp.add_handler(CommandHandler("porn",      porn_setting))
+    dp.add_handler(CommandHandler("celeb",     celeb_setting))
     dp.add_handler(CommandHandler("celebrity", celeb_setting))
-    dp.add_handler(CommandHandler("limit", limit_setting))
-    dp.add_handler(CommandHandler("pause", pause_setting))
-    dp.add_handler(CommandHandler("settings", list_settings))
-    dp.add_handler(CommandHandler("repeat", repeat))
-    dp.add_handler(CommandHandler("go", repeat))
+    dp.add_handler(CommandHandler("limit",     limit_setting))
+    dp.add_handler(CommandHandler("pause",     pause_setting))
+    dp.add_handler(CommandHandler("settings",  list_settings))
+    dp.add_handler(CommandHandler("repeat",    repeat))
+    dp.add_handler(CommandHandler("go",        repeat))
+    dp.add_handler(CommandHandler("markup",    markup))
 
     # on picture message, run the Rekognition workflow
     dp.add_handler(MessageHandler(Filters.photo, label_image))

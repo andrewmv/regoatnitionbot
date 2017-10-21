@@ -24,7 +24,8 @@ default_config = {'label': 'True',
                   'threshold': '50', 
                   'limit': '4', 
                   'pause': 'False',
-                  'last_image': 'None'}
+                  'last_image': 'None',
+                  'celebrity': 'True'}
 
 # Useful for debugging
 keep_local_images = False
@@ -56,14 +57,16 @@ def repeat(bot, update):
         label_image(bot, update, image=lastimage, filename=lastimage)
 
 def label_image(bot, update, image=None, filename=None):
-    # Check if we're paused
-    if setting(update.message.chat.id, 'pause') == 'True':
-        return 0
+    threshold = float(setting(update.message.chat.id, 'threshold'))
 
     # Check if we were provided with already-uploaded image id
     if image==None:
         filename = download_image(bot, update)
         image = get_image(bot, update, filename)
+
+        # Do nothing else if we're paused
+        if setting(update.message.chat.id, 'pause') == 'True':
+            return 0
     else:
         if use_s3:
             image = {
@@ -75,9 +78,12 @@ def label_image(bot, update, image=None, filename=None):
         else:
             image = get_image(bot, update, filename)
 
-    reply_text = ""
+    reply_text = u''
     if setting(update.message.chat.id, 'porn') == 'True':
         reply_text += find_porn(bot, update, image, filename)
+
+    if setting(update.message.chat.id, 'celebrity') == 'True':
+        reply_text += find_celebrities(bot, update, image, filename)
 
     if setting(update.message.chat.id, 'label') == 'True':
         reply_text += find_labels(bot, update, image, filename)
@@ -123,7 +129,7 @@ def get_image(bot, update, filename):
     return img
 
 def find_porn(bot, update, image, filename):
-    text = ''
+    text = u''
     threshold = float(setting(update.message.chat.id, 'threshold'))
     logger.info("Porn tagging image {} using threshold {}".format(filename, threshold))
     try:
@@ -156,6 +162,23 @@ def find_labels(bot, update, image, filename):
         update.message.reply_text(errstr)
     return text
 
+def find_celebrities(bot, update, image, filename):
+    text = u''
+    logger.info("Celebrity tagging image {}".format(filename))
+    try:
+        response = rekog.recognize_celebrities(Image=image)
+        tag_count = 0
+        tag_limit = int(setting(update.message.chat.id, 'limit'))
+        for face in response['CelebrityFaces']:
+            if tag_count >= tag_limit:
+                break
+            text += u'{} - {:.2f}% confidence\n'.format(face['Name'], face['Face']['Confidence'])
+            tag_count += 1
+    except Exception as e:
+        errstr = "Celebrity tagging failed with error: {}".format(e)
+        logger.error(errstr)
+        update.message.reply_text(errstr)
+    return text
 
 # Define a few command handlers. These usually take the two arguments bot and
 # update. Error handlers also receive the raised TelegramError object in error.
@@ -183,6 +206,9 @@ def porn_setting(bot, update):
 
 def pause_setting(bot, update):
     setting_toggler(update, name='pause')
+
+def celeb_setting(bot, update):
+    setting_toggler(update, name='celebrity')
 
 def list_settings(bot, update):
     text = ""
@@ -333,10 +359,13 @@ def main():
     dp.add_handler(CommandHandler("labels", label_setting))
     dp.add_handler(CommandHandler("threshold", threshold_setting))
     dp.add_handler(CommandHandler("porn", porn_setting))
+    dp.add_handler(CommandHandler("celeb", celeb_setting))
+    dp.add_handler(CommandHandler("celebrity", celeb_setting))
     dp.add_handler(CommandHandler("limit", limit_setting))
     dp.add_handler(CommandHandler("pause", pause_setting))
     dp.add_handler(CommandHandler("settings", list_settings))
     dp.add_handler(CommandHandler("repeat", repeat))
+    dp.add_handler(CommandHandler("go", repeat))
 
     # on picture message, run the Rekognition workflow
     dp.add_handler(MessageHandler(Filters.photo, label_image))

@@ -103,3 +103,4 @@ ENV/
 # application specific
 img/*
 rekogbot_settings/*
+.telegramconfig
